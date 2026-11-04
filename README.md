@@ -180,24 +180,108 @@ So if admins registered passkeys while the admin area was served at `example.com
    Do **not** first-load via `whmcs.example.ts.net`, the raw IP, `localhost` as itself, or a CLI license check: those report the wrong hostname and re-break it.
 3. Verify: `clientarea.php` returns `200` (not a `302` to `licenseerror.php`) and responds in ~2 s, not ~19 s.
 
-**Why it recurs / durable fix.** Every admin load via the Tailscale hostname risks re-poisoning the license on the next remote recheck. The durable fix is to make the proxy chain present the real `Host` to WHMCS, e.g. a tiny local nginx between `tailscale serve` and Apache:
-
-```nginx
-location / {
-    proxy_pass https://127.0.0.1:443;
-    proxy_set_header Host example.com;
-    proxy_ssl_server_name on;
-    proxy_ssl_name example.com;
-}
-```
-
-…and make sure the tailnet-only admin restriction (section 3) still allows that local proxy's source address. Alternative: ask WHMCS licensing support to add the tailnet hostname as an allowed domain on the license. Until then, if admin shows a license error, re-run the reissue + clean-`Host` load above.
+**Why it recurs / durable fix.** Every admin load via the Tailscale hostname risks re-poisoning the license on the next remote recheck. The durable fix is to make the proxy chain present the real `Host` to WHMCS. See 11.1 (deployed) and 11.2 (verification). Fallback: ask WHMCS licensing support to add the tailnet hostname as an allowed domain. Until a fix is in place, if admin shows a license error, re-run the reissue + clean-`Host` load above.
 
 **Diagnosis tips.**
 
 - Apache access log: find the first `licenseerror.php` redirect and which client IP / hostname triggered it.
 - `tblconfiguration` rows `License` and `LicenseRemoteChecks`: remote checks ~15 s apart match the page hang.
 - Confirm the key in `/var/www/example.com/public_html/configuration.php` is the official `WHMCS-xxxx` key (not nulled), and that the client-area License page shows the correct bound domains/IP.
+
+### 11.1 Permanent fix (deployed): force the real `Host` with a local nginx
+
+Deployed and verified in production on 2026-11-03. Note: `UseCanonicalName On` + `ServerName example.com` on the vhost does **not** fix this. It was already in place and the license still went Invalid, which shows WHMCS keys off the request's `Host` header, not `SERVER_NAME`.
+
+**Chain:** `tailscale serve` (https `:8443`, tailnet-only) → nginx on `127.0.0.1:8088` → Apache `https://127.0.0.1:443`. nginx forces `Host: example.com` and passes the real tailnet client IP through, so WHMCS only ever sees the licensed domain. Every piece lives outside the WHMCS files, so it survives upgrades.
+
+1. Install nginx and drop in the server block (also remove `/etc/nginx/sites-enabled/default`):
+
+```bash
+sudo apt install nginx-light
+sudo rm /etc/nginx/sites-enabled/default
+```
+
+`/etc/nginx/conf.d/whmcs-tailnet-hostfix.conf`:
+
+```nginx
+# tailscale serve (:8443 tailnet) -> nginx 127.0.0.1:8088 -> Apache https 127.0.0.1:443 with Host example.com
+server {
+    listen 127.0.0.1:8088;
+    server_name _;
+    client_max_body_size 64m;
+    proxy_read_timeout 300s;
+    location / {
+        proxy_pass https://127.0.0.1:443;
+        proxy_ssl_server_name on;
+        proxy_ssl_name example.com;
+        proxy_ssl_verify off;
+        proxy_set_header Host example.com;
+        proxy_set_header X-Forwarded-Host example.com;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP $http_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_redirect https://example.com/ /;
+        proxy_redirect http://example.com/ /;
+    }
+}
+```
+
+```bash
+sudo nginx -t && sudo systemctl enable --now nginx
+```
+
+2. Apache vhost (back up first: `cp example.com-le-ssl.conf example.com-le-ssl.conf.bak-<date>`).
+
+Trust the nginx loopback so `mod_remoteip` still sets `REMOTE_ADDR` to the real `100.x` tailnet client. The section 3 `/sysadmin` rule (`-R '100.64.0.0/10'`) then keeps working unchanged:
+
+```apache
+RemoteIPInternalProxy 192.0.2.10 127.0.0.1
+```
+
+The `/vendor`, `/whmcsupdates` (section 5) and `/includes/api.php` (section 4) locks were keyed on `Host == whmcs.example.ts.net`, which Apache now sees as `example.com`. Add a tailnet-source bypass **before** the Host condition in each block:
+
+```apache
+RewriteCond expr "! -R '100.64.0.0/10'"
+RewriteCond %{HTTP_HOST} !^whmcs\.example\.ts\.net(:443|:8443)?$ [NC]
+# ...existing conditions / RewriteRule for that block unchanged
+```
+
+```bash
+sudo apache2ctl configtest && sudo systemctl reload apache2
+```
+
+3. Repoint serve at nginx (save the old config first: `tailscale serve status --json > serve-before.json`):
+
+```bash
+sudo tailscale serve --bg --https=8443 http://127.0.0.1:8088
+```
+
+**Revert (under a minute):**
+
+```bash
+sudo tailscale serve --bg --https=8443 https+insecure://192.0.2.10:443
+sudo cp -a /etc/apache2/sites-available/example.com-le-ssl.conf.bak-<date> /etc/apache2/sites-available/example.com-le-ssl.conf
+sudo apache2ctl configtest && sudo systemctl reload apache2
+sudo rm /etc/nginx/conf.d/whmcs-tailnet-hostfix.conf && sudo systemctl disable --now nginx
+```
+
+### 11.2 How to verify
+
+1. **Smoke test on the nginx loopback** with a simulated tailnet client:
+   ```bash
+   curl -s -o /dev/null -w '%{http_code} %{redirect_url} %{time_total}\n' \
+     -H "X-Forwarded-For: 100.100.100.100" http://127.0.0.1:8088/clientarea.php
+   ```
+   Expect `302` → `/login` in ~0.6 s, **not** `licenseerror.php`. `/sysadmin/` with that header gives `302` → `login.php`. Without the header it gives `404`, because the tailnet lock still holds.
+2. **Real tailnet load:** open `https://whmcs.example.ts.net:8443/sysadmin/` from a tailnet device. The Apache access log should show the device's real `100.x` IP, and the request should arrive as `Host: example.com`, never the `.ts.net` name.
+3. **Public still blocked:** from off-tailnet, `https://example.com/sysadmin/`, `/includes/api.php`, `/vendor/` and `/whmcsupdates/` should return 404/403. A CDN edge 403 also counts.
+4. **License valid (on-server):**
+   ```bash
+   curl -sk -o /dev/null -w '%{http_code} %{time_total}\n' \
+     -H "Host: example.com" https://127.0.0.1/clientarea.php
+   ```
+   Valid: `302`/`200` in ~2 s or less. Invalid: ~19 s, then a redirect to `licenseerror.php`.
+5. **The real proof is surviving a remote license recheck.** WHMCS rechecks against its license server periodically, so watch the Apache access log for any `licenseerror` over the next 24–48 h. A scheduled `grep -c licenseerror` every few hours works. To prove it right away, load admin **via the tailnet hostname** and use **Help → License Information → Force Remote Check**, then confirm the status stays **Active**.
 
 ## 12. Checklist after any change
 

@@ -15,6 +15,26 @@ A practical, upgrade-safe pattern for taking the WHMCS admin area, API, and SSH 
 
 ---
 
+## Table of Contents
+
+- [1. Goals](#1-goals)
+- [2. Tailscale Serve in front of the admin](#2-tailscale-serve-in-front-of-the-admin)
+- [3. Lock the admin directory to tailnet-only (upgrade-safe)](#3-lock-the-admin-directory-to-tailnet-only-upgrade-safe)
+- [4. Close the public API, keep it for tailnet + allowlist](#4-close-the-public-api-keep-it-for-tailnet--allowlist)
+- [5. Lock /vendor and /whmcsupdates](#5-lock-vendor-and-whmcsupdates)
+- [6. SSH over Tailscale only](#6-ssh-over-tailscale-only)
+- [7. An exit node so automation comes from an allowlisted IP](#7-an-exit-node-so-automation-comes-from-an-allowlisted-ip)
+- [8. Pitfalls we hit](#8-pitfalls-we-hit)
+- [9. Licensing after an upgrade + Tailscale lock (lessons from 2026-11-03)](#9-licensing-after-an-upgrade--tailscale-lock-lessons-from-2026-11-03)
+- [10. Gotcha: moving the admin hostname breaks existing passkeys (WebAuthn)](#10-gotcha-moving-the-admin-hostname-breaks-existing-passkeys-webauthn)
+- [11. Gotcha: the WHMCS license goes Invalid when admin is reached via the Tailscale hostname](#11-gotcha-the-whmcs-license-goes-invalid-when-admin-is-reached-via-the-tailscale-hostname)
+  - [11.1 Permanent fix (deployed): force the real Host with a local nginx](#111-permanent-fix-deployed-force-the-real-host-with-a-local-nginx)
+  - [11.2 How to verify](#112-how-to-verify)
+- [12. Checklist after any change](#12-checklist-after-any-change)
+- [13. Planned](#13-planned)
+- [Credits](#credits)
+- [License](#license)
+
 ## 1. Goals
 
 - Admin area reachable **only** over the tailnet.

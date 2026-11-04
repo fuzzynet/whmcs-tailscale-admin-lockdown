@@ -161,7 +161,45 @@ So if admins registered passkeys while the admin area was served at `example.com
 - **Fix:** each affected user signs in at the **new** hostname with password + their other 2FA (e.g. TOTP), deletes the old passkey and registers a new one. No server-side setting rebinds an existing passkey to a new hostname.
 - **Plan for it:** before moving an admin or client surface to a new hostname, list who has passkeys and warn them they'll need to re-enroll. Keep a non-passkey login path (password + TOTP) available so nobody is locked out during the switch.
 
-## 11. Checklist after any change
+## 11. Gotcha: the WHMCS license goes Invalid when admin is reached via the Tailscale hostname
+
+**Symptom.** After locking admin behind `tailscale serve` at `whmcs.example.ts.net`, admin intermittently redirects every page to `licenseerror.php?status=Invalid`, and each request hangs ~15–20 s (a live, failing call to the WHMCS license server). The public site on `example.com` keeps serving normally; it's admin-only.
+
+**Root cause.** On a remote recheck, WHMCS reports the HTTP `Host` of the incoming request to its license server. The license is bound to the real domain (`example.com`) + server IP (`192.0.2.10`). `tailscale serve` passes the tailnet hostname through as `Host`, so when admin is loaded via `whmcs.example.ts.net` (or the raw IP, or `localhost`) the recheck reports a hostname that isn't in the license's allowed domains. The license server returns Invalid, WHMCS caches it and locks the admin area. Local cached checks keep passing for hours, so it looks fine until the next periodic or forced remote recheck fires from the wrong hostname.
+
+**Immediate fix (no rollback, no nulled files).**
+
+1. In the WHMCS.com client area, open the license and click **Reissue License** (sidebar, "Moving or Reinstalling?"). This resets the bound install location; it's applied on next access.
+2. Immediately force a clean validation that reports the **correct** domain, before anything touches the Tailscale hostname. On the server:
+   ```bash
+   for i in 1 2 3; do
+     curl -sk -o /dev/null -w '%{http_code} %{time_total}\n' \
+       -H "Host: example.com" https://127.0.0.1/clientarea.php
+   done
+   ```
+   Do **not** first-load via `whmcs.example.ts.net`, the raw IP, `localhost` as itself, or a CLI license check: those report the wrong hostname and re-break it.
+3. Verify: `clientarea.php` returns `200` (not a `302` to `licenseerror.php`) and responds in ~2 s, not ~19 s.
+
+**Why it recurs / durable fix.** Every admin load via the Tailscale hostname risks re-poisoning the license on the next remote recheck. The durable fix is to make the proxy chain present the real `Host` to WHMCS, e.g. a tiny local nginx between `tailscale serve` and Apache:
+
+```nginx
+location / {
+    proxy_pass https://127.0.0.1:443;
+    proxy_set_header Host example.com;
+    proxy_ssl_server_name on;
+    proxy_ssl_name example.com;
+}
+```
+
+…and make sure the tailnet-only admin restriction (section 3) still allows that local proxy's source address. Alternative: ask WHMCS licensing support to add the tailnet hostname as an allowed domain on the license. Until then, if admin shows a license error, re-run the reissue + clean-`Host` load above.
+
+**Diagnosis tips.**
+
+- Apache access log: find the first `licenseerror.php` redirect and which client IP / hostname triggered it.
+- `tblconfiguration` rows `License` and `LicenseRemoteChecks`: remote checks ~15 s apart match the page hang.
+- Confirm the key in `/var/www/example.com/public_html/configuration.php` is the official `WHMCS-xxxx` key (not nulled), and that the client-area License page shows the correct bound domains/IP.
+
+## 12. Checklist after any change
 
 - [ ] `https://example.com/admin/` → 404 from outside
 - [ ] `https://whmcs.example.ts.net:8443/admin/` → login page

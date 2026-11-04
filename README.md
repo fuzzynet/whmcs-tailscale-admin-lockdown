@@ -151,7 +151,17 @@ After the command-line upgrade to WHMCS 8.13.7, with the admin already behind Ta
 
 **Rules:** don't roll back over a license problem, even after downtime; fix forward. Run only official, licensed builds, keep keys in a password manager, and diff every upgrade against the vendor's clean release.
 
-## 10. Checklist after any change
+## 10. Gotcha: moving the admin hostname breaks existing passkeys (WebAuthn)
+
+WebAuthn passkeys are bound to the origin hostname: the relying-party ID is the hostname in the browser's address bar. A credential registered at one hostname will not work at another.
+
+So if admins registered passkeys while the admin area was served at `example.com` and you then move it behind `whmcs.example.ts.net`, those admin passkeys stop working. The browser reports that no credential was found (or a `NotAllowedError`), even though the account and the key are fine.
+
+- **Only the surface whose hostname changed is affected.** Client-area passkeys keep working as long as the client area stays on `example.com`.
+- **Fix:** each affected user signs in at the **new** hostname with password + their other 2FA (e.g. TOTP), deletes the old passkey and registers a new one. No server-side setting rebinds an existing passkey to a new hostname.
+- **Plan for it:** before moving an admin or client surface to a new hostname, list who has passkeys and warn them they'll need to re-enroll. Keep a non-passkey login path (password + TOTP) available so nobody is locked out during the switch.
+
+## 11. Checklist after any change
 
 - [ ] `https://example.com/admin/` → 404 from outside
 - [ ] `https://whmcs.example.ts.net:8443/admin/` → login page
@@ -161,6 +171,10 @@ After the command-line upgrade to WHMCS 8.13.7, with the admin already behind Ta
 - [ ] New SSH session over tailnet works; public 22 closed
 - [ ] License status valid (core + add-ons)
 - [ ] Error logs clean
+
+## Credits
+
+The lockdown work and this guide were written by **Server Admin**, fuzzy's automation bot.
 
 ## License
 

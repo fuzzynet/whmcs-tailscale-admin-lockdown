@@ -35,10 +35,11 @@ A practical, upgrade-safe pattern for taking the WHMCS admin area, API, and SSH 
   - [11.1 Permanent fix (deployed): force the real Host with a local nginx](#111-permanent-fix-deployed-force-the-real-host-with-a-local-nginx)
   - [11.2 How to verify](#112-how-to-verify)
 - [12. Checklist after any change](#12-checklist-after-any-change)
-- [13. Planned](#13-planned)
-- [14. Cloudflare edge hardening](#14-cloudflare-edge-hardening)
+- [13. Passkeys on a tailnet-only admin: admin.example.com](#13-passkeys-on-a-tailnet-only-admin-adminexamplecom-deployed-2026-11-04)
+- [14. Planned](#14-planned)
 - [Credits](#credits)
 - [License](#license)
+- [14. Cloudflare edge hardening](#14-cloudflare-edge-hardening)
 
 ## 1. Goals
 
@@ -332,9 +333,38 @@ sudo rm /etc/nginx/conf.d/nginx-tailnet-hostfix.conf && sudo systemctl disable -
 - [ ] License status valid (core + add-ons)
 - [ ] Error logs clean
 
-## 13. Planned
+## 13. Passkeys on a tailnet-only admin: `admin.example.com` (deployed 2026-11-04)
 
-Passkey (WebAuthn) as a second factor, and a reCAPTCHA v3 upgrade of the login form, are still to come. Registering passkeys depends on the admin hostname staying put: section 10 explains why a hostname move invalidates existing WebAuthn credentials, so enroll them only after the tailnet hostname is settled and keep password plus TOTP available.
+Section 10 means a passkey made for `example.com` can never work at `whmcs.example.ts.net`. The fix is a **subdomain of the real domain that only resolves to the server's tailnet IP**. WebAuthn lets `admin.example.com` use the parent `example.com` as its relying-party ID, so one rpId covers both the client area and the admin.
+
+How it is wired:
+
+1. **DNS:** a public, DNS-only (grey cloud) `A admin.example.com -> 100.x.y.z` (the server's Tailscale IP). Off the tailnet a 100.64/10 address is unroutable, so nothing loads. No tailnet DNS change is needed.
+2. **Certificate:** Let's Encrypt via DNS-01 (HTTP-01 can't reach a tailnet IP). Set up a scoped DNS API token + `certbot-dns-cloudflare` so it auto-renews; a one-off `--manual` cert will **not** renew.
+3. **Free 443 on the tailnet IP:** Apache's `Listen 443` takes every address. Change it to the public IPv4, public IPv6, `127.0.0.1` and `[::1]`, so nginx can own `100.x.y.z:443`.
+4. **nginx** (`examples/nginx-admin-subdomain.conf`): listens only on the tailnet IP, `allow 100.64.0.0/10; deny all;`, proxies to the origin with `Host: example.com` (license binding unchanged, same trick as section 11.1) and rewrites `Location`/cookie domains back to `admin.example.com`.
+5. **Firewall:** `ufw allow in on tailscale0 to 100.x.y.z port 443 proto tcp` (Tailscale Serve bypasses ufw, a normal listener does not).
+
+Result: the browser origin is `https://admin.example.com`, while WHMCS still only ever sees `example.com`. The old `whmcs.example.ts.net:8443` URL keeps working (password + TOTP), but passkeys only work on the new name.
+
+### 13.1 Passkey module and reCAPTCHA v3
+
+- Use a properly licensed passkey add-on (we use Keyora by Syndaq). Remove any nulled module's files and template edits, but keep its tables until you are sure.
+- If your admin folder is renamed (e.g. `/sysadmin`), add-ons that auto-patch `admin/templates/login.tpl` will miss it, so add their script to your renamed folder's `templates/login.tpl` by hand, between the module's markers.
+- Leave the module's rpId override **empty**, so it uses the SystemURL host (`example.com`), which is valid for `admin.example.com`.
+- reCAPTCHA v3: `CaptchaType = recaptchav3`, with v3 keys and a score threshold of `0.5`. Some themes still print `render=explicit` in the loader; check a real login works.
+
+### 13.2 Verify
+
+- [ ] From the tailnet: `https://admin.example.com/` → 302 to `/sysadmin/`, login page 200, cert CN `admin.example.com`
+- [ ] From the internet: `admin.example.com` times out
+- [ ] Public site, public API 404, old tailnet URL all unchanged
+- [ ] Passkey add-on license valid for `example.com`; WHMCS license valid
+- [ ] Real login: enroll a passkey at `admin.example.com`, sign out, sign in with it
+
+## 14. Planned
+
+- Auto-renewing DNS-01 for the admin subdomain certificate.
 
 ## 14. Cloudflare edge hardening
 

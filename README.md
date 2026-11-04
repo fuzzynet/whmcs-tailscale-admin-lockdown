@@ -118,26 +118,38 @@ Gotchas:
 
 ## 9. Licensing after an upgrade + Tailscale lock (lessons from 2026-11-03)
 
-After upgrading WHMCS to 8.13.7 and putting the admin behind Tailscale Serve, the core license and add-on module license checks stopped validating. It was fixed the same afternoon (roughly 1–2 PM MST), without rolling back. What happened and what we did:
+After the command-line upgrade to WHMCS 8.13.7, with the admin already behind Tailscale Serve, the core license and add-on license checks failed. The timeline below comes from the server's sudo log, web access log, WHMCS activity log and backup timestamps. All times are MST.
 
-**How it works.** The core license stores a signed *local key* in the `License` row of `tblconfiguration`. Many commercial add-on modules store a `licensekey` plus a cached `localkey`/`licensestatus` in `tbladdonmodules`. After a **reissue**, the next remote check records the hostname, IP, and install directory it sees and binds the license to them.
+**How it works.** The core license keeps a signed *local key* in the `License` row of `tblconfiguration`. Many commercial add-ons keep a `licensekey` plus a cached `localkey`/`licensestatus` in `tbladdonmodules`. A remote check records the hostname, IP and directory it sees, and the license is bound to them.
 
-**What went wrong.** After the reissue, the first checks didn't come from the public site. Tailscale Serve was proxying to `127.0.0.1`, so WHMCS saw a loopback address and the tailnet hostname. A command-line license check had run as well, with no web hostname at all. The licenses bound to the wrong context, and the admin was locked out.
+**What actually happened**
+| Time | Event |
+|---|---|
+| 10:37 | Upgrade run from the command line (`install/bin/installer.php -u`). |
+| 10:38–10:42 | **Command-line core license checks**: a small diagnostic script forced the official `validate()` remote check several times, outside any web request. |
+| 10:39 | First web load of the admin after the upgrade came through Serve from **loopback** and showed `licenseerror.php`. |
+| 10:57 | Admin login worked again over the tailnet. |
+| 12:37–12:40 | Every add-on's settings page was rendered from the command line to read its license status. |
+| 12:54–13:01 | Licence keys for four add-ons from one vendor were re-saved **from the command line** (and repeated once), after a table backup. |
+| 13:08–13:10 | Add-on settings opened and saved through the real admin web page (*System Settings → Addon Modules*), with setting checksums taken before and after. |
+| 13:20–13:26 | An admin access rule was changed and the admin was signed in to from the allowlisted IP: **second `licenseerror.php`**. |
+| 13:57–14:00 | Core `License` row and `tbladdonmodules` backed up. Checksums show one add-on had pulled a fresh `localkey`. |
+| 14:03 | Serve repointed from loopback to the server's public IP, with `UseCanonicalName On` and `mod_remoteip` trusting only the server itself. |
+| 14:07 | Core local key refreshed by a normal web load. No further license errors that day. |
 
-**What fixed it (all of it standard licensing):**
-1. **Back up first.** Dump the core `License` row, the full `tbladdonmodules` table, and the admin user row you'll sign in with. Also save checksums of each add-on setting. Diff them afterwards so you can show that only the cached local keys changed.
-2. **Make the server present one consistent identity.** Point Tailscale Serve at the server's **public IP** rather than loopback (`tailscale serve --bg --https=8443 https+insecure://<public-ip>:443`). Set `UseCanonicalName On` in the SSL vhost. Use `mod_remoteip` so that `X-Forwarded-For` is trusted only from the server itself, which keeps the real client IP for logs and login bans. Allow the tailnet `Host` header only when the request arrives from loopback or the server's own IP, never from the internet.
-3. **Reissue the core license** in the WHMCS client area (*Services → license → Reissue*).
-4. **Do the first load from the real public hostname** (`https://example.com/`) before anything else touches WHMCS. Don't load it first from the `ts.net` name, `localhost`, the command line, or cron.
-5. **Add-on modules.** Open each module's settings and re-save the licence key from the vendor account. Let the module fetch a fresh local key on a normal web load. If one still refuses, ask the vendor's support to reissue it for the correct domain.
-6. **Verify.** Core license status shows *Active*, each add-on reports a valid license, and the before/after setting diff shows only the `localkey`/token rows changed. Then sign in to `/admin` over Tailscale as usual.
+**Takeaways**
+- Both license errors followed checks made outside a normal public-hostname web request: command-line `validate()` calls and command-line add-on saves, plus loads through Serve from loopback. Treat command-line license checks as harmful right after an upgrade or reissue.
+- What ended the errors was giving WHMCS one consistent identity: Serve proxied to the **public IP**, a canonical hostname, and real client IPs only from the server itself. After that, a normal web load refreshed the core key.
+- Re-save add-on license keys **in the admin web page**, not from the command line. Check settings checksums before and after, so you can show that only the cached `localkey`/token rows changed.
 
-**Rules we adopted:**
-- Plan license reissues *before* changing hostnames, proxies, or Serve targets.
-- Never run command-line license checks right after a reissue.
-- Never do the first load from a tailnet or internal hostname.
-- **Don't roll back the upgrade** over a license problem, even after downtime. Fix forward with a reissue and vendor support. Rolling back doesn't undo the binding.
-- Only run official, licensed builds, and keep license keys in a password manager. Diff every upgrade against the vendor's clean release.
+**Recommended order next time**
+1. Back up the `License` row, `tbladdonmodules` and the admin row you'll use, and take settings checksums.
+2. Set up the Serve target, `UseCanonicalName` and `mod_remoteip` **before** the upgrade or reissue.
+3. If the license needs it, reissue in the vendor client area. Then do the first load from the real public hostname (`https://example.com/`), with no command-line checks and no tailnet-first load.
+4. Re-save each add-on key in the admin web page. Ask the vendor's support for anything that still fails.
+5. Confirm the core status is *Active*, each add-on shows a valid license, and the error log is clean.
+
+**Rules:** don't roll back over a license problem, even after downtime; fix forward. Run only official, licensed builds, keep keys in a password manager, and diff every upgrade against the vendor's clean release.
 
 ## 10. Checklist after any change
 

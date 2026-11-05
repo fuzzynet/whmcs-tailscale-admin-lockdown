@@ -362,6 +362,16 @@ Result: the browser origin is `https://admin.example.com`, while WHMCS still onl
 - [ ] Passkey add-on license valid for `example.com`; WHMCS license valid
 - [ ] Real login: enroll a passkey at `admin.example.com`, sign out, sign in with it
 
+### 13.3 Gotcha: admin passkey says "Failed to fetch"
+
+If the admin is on `admin.example.com` but WHMCS `SystemURL` is `https://example.com`, a passkey add-on that builds its API URL from `SystemURL` makes the browser fetch `https://example.com/modules/addons/<passkey_module>/...` from the admin page. That is cross-origin, so it fails with `Failed to fetch`.
+
+Fix without touching the add-on (its files may be integrity-checked): an `AdminAreaHeadOutput` hook that wraps `window.fetch` on `admin.example.com` only and rewrites those URLs to same-origin paths. See [`examples/hooks/admin-sameorigin-fetch.php`](examples/hooks/admin-sameorigin-fetch.php). Undo: delete the file.
+
+### 13.4 Client "Passkeys" link in the Account menu
+
+In WHMCS 8 the **Account** menu lives in the **secondary** navbar. Add-on hooks that look for `Account` in the primary navbar never add their item. Our own hook adds "Passkeys" via `ClientAreaSecondaryNavbar` and a "Manage Passkeys" panel on the user Security page. See [`examples/hooks/client-passkeys-links.php`](examples/hooks/client-passkeys-links.php). Only our own hooks are included here, no vendor module code.
+
 ## 14. Planned
 
 - Auto-renewing DNS-01 for the admin subdomain certificate.

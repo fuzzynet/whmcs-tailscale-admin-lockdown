@@ -35,7 +35,7 @@ A practical, upgrade-safe pattern for taking the WHMCS admin area, API, and SSH 
   - [11.1 Permanent fix (deployed): force the real Host with a local nginx](#111-permanent-fix-deployed-force-the-real-host-with-a-local-nginx)
   - [11.2 How to verify](#112-how-to-verify)
 - [12. Checklist after any change](#12-checklist-after-any-change)
-- [13. Passkeys on a tailnet-only admin: admin.example.com](#13-passkeys-on-a-tailnet-only-admin-adminexamplecom-deployed-2026-11-04)
+- [13. Passkeys on a tailnet-only admin: admin.example.com](#13-passkeys-on-a-tailnet-only-admin-adminexamplecom-tivro-as-of-2026-11-05)
 - [14. Planned](#14-planned)
 - [Credits](#credits)
 - [License](#license)
@@ -190,7 +190,8 @@ So if admins registered passkeys while the admin area was served at `example.com
 
 - **Only the surface whose hostname changed is affected.** Client-area passkeys keep working as long as the client area stays on `example.com`.
 - **Fix:** each affected user signs in at the **new** hostname with password + their other 2FA (e.g. TOTP), deletes the old passkey and registers a new one. No server-side setting rebinds an existing passkey to a new hostname.
-- **Plan for it:** before moving an admin or client surface to a new hostname, list who has passkeys and warn them they'll need to re-enroll. Keep a non-passkey login path (password + TOTP) available so nobody is locked out during the switch.
+- **Plan for it:** before moving an admin or client surface to a new hostname, list who has passkeys and warn them they'll need to re-enroll. Keep password login available so nobody is locked out during the switch.
+- **Where this landed:** section 13. As of 2026-11-05 (America/Phoenix) the live modules are Tivro Passkeys on `example.com` and TivroAdminPasskeys on `admin.example.com`. Password login remains available on both.
 
 ## 11. Gotcha: the WHMCS license goes Invalid when admin is reached via the Tailscale hostname
 
@@ -331,11 +332,23 @@ sudo rm /etc/nginx/conf.d/nginx-tailnet-hostfix.conf && sudo systemctl disable -
 - [ ] Gateway callback and API paths are not challenged at the Cloudflare edge (section 14)
 - [ ] New SSH session over tailnet works; public 22 closed
 - [ ] License status valid (core + add-ons)
+- [ ] Admin passkey sign-in at `https://admin.example.com/` (TivroAdminPasskeys 1.0.5) and client passkeys on `example.com`; password login still works
 - [ ] Error logs clean
 
-## 13. Passkeys on a tailnet-only admin: `admin.example.com` (deployed 2026-11-04)
+## 13. Passkeys on a tailnet-only admin: `admin.example.com` (Tivro, as of 2026-11-05)
 
-Section 10 means a passkey made for `example.com` can never work at `whmcs.example.ts.net`. The fix is a **subdomain of the real domain that only resolves to the server's tailnet IP**. WebAuthn lets `admin.example.com` use the parent `example.com` as its relying-party ID, so one rpId covers both the client area and the admin.
+Section 10 means a passkey registered for one hostname will not work at another. The admin area is served at a **subdomain of the real domain that only resolves to the server's tailnet IP**, and the admin passkey module's RP ID is that subdomain.
+
+Live stack as of 2026-11-05 (America/Phoenix). Hostnames below are this repo's placeholders (`example.com` is the public site, `admin.example.com` is the tailnet-only admin host):
+
+| Surface | Module | RP ID |
+|---|---|---|
+| Client area (public site) | Tivro Passkeys (`tivro_passkeys`), active, lifetime licence | `example.com` |
+| Admin | TivroAdminPasskeys **1.0.5** (PHP 8.2 ionCube build) at `modules/addons/tivro_adminpasskeys` | `admin.example.com` |
+
+Admin and client passkeys are separate credentials, each bound to its own RP ID. Password login remains available on both surfaces.
+
+Because the admin RP ID is `admin.example.com`, the browser origin has to be `https://admin.example.com`. A `*.ts.net` hostname cannot satisfy that RP ID. The name is still a normal public DNS hostname with a publicly trusted certificate, so WebAuthn accepts it, while a `100.64.0.0/10` address does not route off the tailnet.
 
 How it is wired:
 
@@ -345,13 +358,16 @@ How it is wired:
 4. **nginx** (`examples/nginx-admin-subdomain.conf`): listens only on the tailnet IP, `allow 100.64.0.0/10; deny all;`, proxies to the origin with `Host: example.com` (license binding unchanged, same trick as section 11.1) and rewrites `Location`/cookie domains back to `admin.example.com`.
 5. **Firewall:** `ufw allow in on tailscale0 to 100.x.y.z port 443 proto tcp` (Tailscale Serve bypasses ufw, a normal listener does not).
 
-Result: the browser origin is `https://admin.example.com`, while WHMCS still only ever sees `example.com`. The old `whmcs.example.ts.net:8443` URL keeps working (password + TOTP), but passkeys only work on the new name.
+Result: the browser origin is `https://admin.example.com`, while WHMCS still only ever sees `example.com`. Admin passkeys work on that origin. The old `whmcs.example.ts.net:8443` URL still accepts password login.
 
-### 13.1 Passkey module and reCAPTCHA v3
+### 13.1 Tivro modules and reCAPTCHA v3
 
-- Use a properly licensed passkey add-on (we use Keyora by Syndaq). Remove any nulled module's files and template edits, but keep its tables until you are sure.
-- If your admin folder is renamed (e.g. `/sysadmin`), add-ons that auto-patch `admin/templates/login.tpl` will miss it, so add their script to your renamed folder's `templates/login.tpl` by hand, between the module's markers.
-- Leave the module's rpId override **empty**, so it uses the SystemURL host (`example.com`), which is valid for `admin.example.com`.
+- **Client:** Tivro Passkeys (`tivro_passkeys`) is the active client-area add-on, on a lifetime licence. Its RP ID is the public host (`example.com`).
+- **Admin:** TivroAdminPasskeys **1.0.5**, PHP 8.2 ionCube build, installed at `modules/addons/tivro_adminpasskeys`. Its RP ID setting is `admin.example.com`.
+- **Usernameless login is native in 1.0.5.** An empty-username `auth_begin` returns `allowCredentials` from the module. Empty-username Bitwarden passkey sign-in works on this build.
+- **Empty-username hotfix (historical, removed).** Before 1.0.5, that response was patched in front of the module with an Apache `Substitute` inject, the hook `fuzz_tivro_admin_usernameless`, and the addon `fuzz_hotfix_tivro_usernameless`. All three were removed after 1.0.5. Leave them uninstalled; the module returns `allowCredentials` itself.
+- **Keyora (Syndaq) is removed.** It was the previous passkey add-on. Its files are archived off the live WHMCS tree and its database rows were cleaned. It is historical only.
+- **Password fallback** stays enabled, so a missing passkey is not a lockout.
 - reCAPTCHA v3: `CaptchaType = recaptchav3`, with v3 keys and a score threshold of `0.5`. Some themes still print `render=explicit` in the loader; check a real login works.
 
 ### 13.2 Verify
@@ -359,18 +375,23 @@ Result: the browser origin is `https://admin.example.com`, while WHMCS still onl
 - [ ] From the tailnet: `https://admin.example.com/` → 302 to `/sysadmin/`, login page 200, cert CN `admin.example.com`
 - [ ] From the internet: `admin.example.com` times out
 - [ ] Public site, public API 404, old tailnet URL all unchanged
-- [ ] Passkey add-on license valid for `example.com`; WHMCS license valid
+- [ ] Tivro Passkeys active (lifetime licence, RP ID `example.com`); TivroAdminPasskeys 1.0.5 active (RP ID `admin.example.com`); WHMCS license valid
+- [ ] Keyora is not enabled and its files are not in the live modules tree
 - [ ] Real login: enroll a passkey at `admin.example.com`, sign out, sign in with it
+- [ ] Empty-username `auth_begin` includes `allowCredentials`; a Bitwarden usernameless sign-in completes
+- [ ] Password sign-in still works
 
 ### 13.3 Gotcha: admin passkey says "Failed to fetch"
 
-If the admin is on `admin.example.com` but WHMCS `SystemURL` is `https://example.com`, a passkey add-on that builds its API URL from `SystemURL` makes the browser fetch `https://example.com/modules/addons/<passkey_module>/...` from the admin page. That is cross-origin, so it fails with `Failed to fetch`.
+If the admin is on `admin.example.com` but WHMCS `SystemURL` is `https://example.com`, TivroAdminPasskeys builds its API URL from `SystemURL` and the browser fetches `https://example.com/modules/addons/tivro_adminpasskeys/...` from the admin page. That is cross-origin, so it fails with `Failed to fetch`.
 
-Fix without touching the add-on (its files may be integrity-checked): an `AdminAreaHeadOutput` hook that wraps `window.fetch` on `admin.example.com` only and rewrites those URLs to same-origin paths. See [`examples/hooks/admin-sameorigin-fetch.php`](examples/hooks/admin-sameorigin-fetch.php). Undo: delete the file.
+The admin vhost in section 13 keeps presenting `Host: example.com` to WHMCS and rewriting redirects and cookies back to `admin.example.com`. Same-origin for those API calls is a separate hook: `AdminAreaHeadOutput` wraps `window.fetch` on `admin.example.com` only and rewrites `tivro_adminpasskeys` URLs to same-origin paths. The add-on's own files stay untouched (they may be integrity-checked). See [`examples/hooks/admin-sameorigin-fetch.php`](examples/hooks/admin-sameorigin-fetch.php). Undo: delete the file.
+
+The Apache `Substitute` inject in section 13.1 belonged to that removed usernameless hotfix and is uninstalled. The fetch rewrite is the hook file above.
 
 ### 13.4 Client "Passkeys" link in the Account menu
 
-In WHMCS 8 the **Account** menu lives in the **secondary** navbar. Add-on hooks that look for `Account` in the primary navbar never add their item. Our own hook adds "Passkeys" via `ClientAreaSecondaryNavbar` and a "Manage Passkeys" panel on the user Security page. See [`examples/hooks/client-passkeys-links.php`](examples/hooks/client-passkeys-links.php). Only our own hooks are included here, no vendor module code.
+In WHMCS 8 the **Account** menu lives in the **secondary** navbar. Add-on hooks that look for `Account` in the primary navbar never add their item. Our own hook adds "Passkeys" to that secondary menu, pointing at Tivro Passkeys (`index.php?m=tivro_passkeys`), and adds a "Manage Passkeys" panel on the user Security page. See [`examples/hooks/client-passkeys-links.php`](examples/hooks/client-passkeys-links.php). Only our own hooks are included here, no vendor module code.
 
 ## 14. Planned
 

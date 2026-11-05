@@ -10,6 +10,10 @@ A practical, upgrade-safe pattern for taking the WHMCS admin area, API, and SSH 
 | `192.0.2.10` | This server's public IP |
 | `203.0.113.10` | An allowlisted static/home IP (documentation range) |
 | `100.64.0.0/10` | Tailscale CGNAT range |
+| `<ZONE_ID>` | Cloudflare zone ID |
+| `<ORIGIN_IP>` | Origin public IP. Other sections write this as `192.0.2.10` |
+| `<HOME_IP>` | Allowlisted static/home IP. Other sections write this as `203.0.113.10` |
+| `$CF_API_TOKEN` | Cloudflare API token (secrets manager; never git) |
 
 > Assumes Apache 2.4 + PHP-FPM on Ubuntu. Nginx equivalents are noted where they differ.
 
@@ -32,6 +36,7 @@ A practical, upgrade-safe pattern for taking the WHMCS admin area, API, and SSH 
   - [11.2 How to verify](#112-how-to-verify)
 - [12. Checklist after any change](#12-checklist-after-any-change)
 - [13. Planned](#13-planned)
+- [14. Cloudflare edge hardening](#14-cloudflare-edge-hardening)
 - [Credits](#credits)
 - [License](#license)
 
@@ -43,6 +48,7 @@ A practical, upgrade-safe pattern for taking the WHMCS admin area, API, and SSH 
 - SSH only over Tailscale; public port 22 closed.
 - Every change survives WHMCS upgrades and can be re-applied in one step.
 - Licensing keeps working (see section 9 — read it **before** you change hostnames).
+- Public HTTP(S) enters through Cloudflare. Origin port 443 accepts Cloudflare's ranges only, and WHMCS still sees the visitor IP (section 14).
 
 ## 2. Tailscale Serve in front of the admin
 
@@ -66,6 +72,7 @@ Key points:
 - Keep the rules in a file `Include`d from the :443 vhost. nginx forces `Host: example.com` (section 11.1), so the `/sysadmin` lock matches the tailnet range `100.64.0.0/10`.
 - Allow that tailnet range and your allowlisted IP. Answer everyone else with a real HTTP 404 (via `mod_rewrite`, not `Require`, which would give 403) so the path isn't advertised.
 - `RemoteIPInternalProxy` must list this server's IP **and** `127.0.0.1`. The nginx hop is loopback; omitting `127.0.0.1` makes every tailnet client appear as `127.0.0.1`, and a login ban on that address locks everyone out (section 8).
+- On a Cloudflare-proxied origin, `RemoteIPHeader` is `CF-Connecting-IP` and `RemoteIPTrustedProxy` is Cloudflare's published ranges (section 14). Switch that header together with the nginx `CF-Connecting-IP` line, or tailnet clients show up as the origin IP and this lock misses.
 - The same tailnet bypass (`RewriteCond expr "! -R '100.64.0.0/10'"`) sits in front of the `/includes/api.php` rule and the `/vendor|whmcsupdates` rule.
 - Keep both confs plus [`examples/reapply-lockdown.sh`](examples/reapply-lockdown.sh) next to your upgrade notes.
 
@@ -91,7 +98,7 @@ curl -s https://example.com/includes/api.php \
 ```
 Never put the identifier/secret on the command line in shared logs; read them from a secrets manager.
 
-> Exception to plan for: payment gateway callbacks (e.g. `modules/gateways/callback/*`) must stay public. Only lock `api.php`.
+> Exception to plan for: payment gateway callbacks (e.g. `modules/gateways/callback/*`) must stay public. Only lock `api.php`. Those callback paths, and `includes/api.php`, also need a Cloudflare skip so rate limiting, managed WAF, and Super Bot Fight Mode do not challenge the server-to-server call (section 14).
 
 ## 5. Lock `/vendor` and `/whmcsupdates`
 
@@ -135,7 +142,8 @@ Gotchas:
 - **Self-inflicted login ban on 127.0.0.1.** If Tailscale Serve proxies from loopback without real-IP handling, every admin looks like `127.0.0.1` to WHMCS. A few failed logins (or a script with a blank API secret) bans `127.0.0.1` and locks out *everyone*. Fix: remove the entry under *Utilities → Logs → Banned IPs* (or the `tblbannedips` table) and make sure WHMCS sees the real client IP — configure trusted proxies (`$trusted_proxies` / X-Forwarded-For handling) and Apache `mod_remoteip`, with `127.0.0.1` listed on `RemoteIPInternalProxy` (section 3).
 - **Empty API secrets ban your allowlisted IP.** Wrap API calls in a helper that refuses to send if identifier/secret is empty.
 - **Upgrades don't remove vhost rules, but panel rebuilds can.** Always run the re-apply script and the outside/inside checks after maintenance.
-- **Gateways and webhooks.** Some payment processors refuse to call private/CGNAT addresses; keep their callbacks on public HTTPS.
+- **Gateways and webhooks.** Some payment processors refuse to call private/CGNAT addresses; keep their callbacks on public HTTPS. Exempt those paths (and the API) from Cloudflare rate limiting, managed WAF, and Super Bot Fight Mode (section 14).
+- **`CF-Connecting-IP` without the hostfix header.** Switching `RemoteIPHeader` to `CF-Connecting-IP` without `proxy_set_header CF-Connecting-IP $http_x_forwarded_for;` makes tailnet clients appear as the origin IP. The `100.64.0.0/10` bypass misses, and the admin/API lock 404s them. Fix is in section 14.
 - **Licensing** — see next section. This was our biggest outage.
 
 ## 9. Licensing after an upgrade + Tailscale lock (lessons from 2026-11-03)
@@ -241,6 +249,7 @@ server {
         proxy_set_header X-Forwarded-Host example.com;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Real-IP $http_x_forwarded_for;
+        proxy_set_header CF-Connecting-IP $http_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
         proxy_redirect https://example.com/ /;
         proxy_redirect http://example.com/ /;
@@ -254,7 +263,7 @@ sudo nginx -t && sudo systemctl enable --now nginx
 
 2. Apache vhost (back up first: `cp example.com-le-ssl.conf example.com-le-ssl.conf.bak-<date>`).
 
-Trust the nginx loopback so `mod_remoteip` still sets `REMOTE_ADDR` to the real `100.x` tailnet client. The section 3 `/sysadmin` rule (`-R '100.64.0.0/10'`) then keeps working unchanged:
+Trust the nginx loopback so `mod_remoteip` still sets `REMOTE_ADDR` to the real `100.x` tailnet client. The section 3 `/sysadmin` rule (`-R '100.64.0.0/10'`) then keeps working unchanged. When section 14 switches `RemoteIPHeader` to `CF-Connecting-IP`, the `CF-Connecting-IP` line in the nginx block is what keeps that `100.x` address; without it the client shows up as the origin IP:
 
 ```apache
 RemoteIPInternalProxy 192.0.2.10 127.0.0.1
@@ -316,6 +325,9 @@ sudo rm /etc/nginx/conf.d/nginx-tailnet-hostfix.conf && sudo systemctl disable -
 - [ ] `/vendor`, `/whmcsupdates` → 404 from outside the tailnet
 - [ ] `/status` → 200 (intentionally public)
 - [ ] Checkout + gateway callback test passes
+- [ ] Origin 443 accepts Cloudflare ranges only; port 80 still open for HTTP-01 (section 14)
+- [ ] After the `CF-Connecting-IP` switch, a tailnet admin still logs as `100.x`, not `<ORIGIN_IP>`
+- [ ] Gateway callback and API paths are not challenged at the Cloudflare edge (section 14)
 - [ ] New SSH session over tailnet works; public 22 closed
 - [ ] License status valid (core + add-ons)
 - [ ] Error logs clean
@@ -323,6 +335,118 @@ sudo rm /etc/nginx/conf.d/nginx-tailnet-hostfix.conf && sudo systemctl disable -
 ## 13. Planned
 
 Passkey (WebAuthn) as a second factor, and a reCAPTCHA v3 upgrade of the login form, are still to come. Registering passkeys depends on the admin hostname staying put: section 10 explains why a hostname move invalidates existing WebAuthn credentials, so enroll them only after the tailnet hostname is settled and keep password plus TOTP available.
+
+## 14. Cloudflare edge hardening
+
+Public `example.com` is proxied at Cloudflare. Admin stays on the tailnet (section 11.1) and does not go through that proxy. Placeholders match the table at the top: `<ORIGIN_IP>` is `192.0.2.10`, `<HOME_IP>` is `203.0.113.10`, the zone is `<ZONE_ID>`, the token is `$CF_API_TOKEN`. Snippets: [`examples/cloudflare-edge-hardening.md`](examples/cloudflare-edge-hardening.md).
+
+### 14.1 DNS and TLS
+
+- A/AAAA for `example.com` are proxied (orange cloud). `whmcs.example.ts.net` is MagicDNS, not a Cloudflare record.
+- SSL/TLS mode **Full (strict)**. The origin certificate must be valid for `example.com` (the existing Let's Encrypt cert).
+- Authenticated Origin Pulls is recommended once Full (strict) already works: [Authenticated Origin Pulls](https://developers.cloudflare.com/ssl/origin-configuration/authenticated-origin-pull/).
+- `<ZONE_ID>` and `$CF_API_TOKEN` stay out of git.
+
+### 14.2 Origin firewall: 443 from Cloudflare only
+
+Port 443 on the origin accepts Cloudflare's published ranges and nothing else, so a direct connection to `<ORIGIN_IP>` never reaches Apache. Port 80 stays open for ACME HTTP-01 (Let's Encrypt).
+
+- https://www.cloudflare.com/ips-v4
+- https://www.cloudflare.com/ips-v6
+
+Re-check both URLs on a schedule. The CIDRs live in two places and move together: this firewall, and Apache `RemoteIPTrustedProxy` (14.3). A firewall list that gained a range Apache does not trust yet still connects, and WHMCS logs the edge IP. `ufw` needs `IPV6=yes`, or the v6 half is a no-op.
+
+`<HOME_IP>` is not a 443 hole. Admins use the tailnet. That address is the section 4 allowlist, applied to the client IP `mod_remoteip` restored.
+
+```bash
+# Drop the generic 443 allow, then permit each published CIDR.
+# The delete loop clears a previous run so rules do not stack.
+sudo ufw delete allow 443/tcp || true
+while sudo ufw status numbered | grep -q 'cloudflare-443'; do
+  n="$(sudo ufw status numbered | grep 'cloudflare-443' | tail -1 | sed -nE 's/^\[[[:space:]]*([0-9]+)\].*/\1/p')"
+  if [ -z "$n" ]; then
+    echo "could not parse a cloudflare-443 rule number" >&2
+    break
+  fi
+  sudo ufw --force delete "$n"
+done
+while read -r cidr; do
+  [ -n "$cidr" ] || continue
+  sudo ufw allow from "$cidr" to any port 443 proto tcp comment 'cloudflare-443'
+done < <(curl -fsS https://www.cloudflare.com/ips-v4; echo; curl -fsS https://www.cloudflare.com/ips-v6)
+sudo ufw allow 80/tcp comment 'acme-http-01'
+```
+
+Close 443 to the world on any provider firewall too (same habit as port 22 in section 6). Leave 80 open there.
+
+Verify from a host that is not Cloudflare: `https://<ORIGIN_IP>/` times out or is refused. `https://example.com/status` still returns `200`.
+
+### 14.3 Real client IP (`mod_remoteip`)
+
+WHMCS logs, fraud rules, and Banned IPs key off `REMOTE_ADDR`. `CF-Connecting-IP` is the visitor address Cloudflare sends to the origin. Without it, every public client is an edge address: a ban lands on that edge, and the next visitor through the same address looks banned.
+
+```apache
+RemoteIPHeader CF-Connecting-IP
+# One directive per CIDR from the two URLs in 14.2. Same fetch as ufw.
+RemoteIPTrustedProxy <CF_CIDR>
+RemoteIPInternalProxy <ORIGIN_IP> 127.0.0.1
+```
+
+`RemoteIPTrustedProxy` is the Cloudflare ranges only. `RemoteIPInternalProxy` is the local chain: `127.0.0.1` (nginx) and `<ORIGIN_IP>`. Omitting `127.0.0.1` is the section 8 lockout.
+
+Replace the `RemoteIPHeader X-Forwarded-For` lines in [`examples/apache-whmcs-lockdown.conf`](examples/apache-whmcs-lockdown.conf) with this block in the same change as 14.4. The example file generates one `RemoteIPTrustedProxy` per current CIDR. Do not commit that generated list.
+
+### 14.4 Tailnet hostfix must pass `CF-Connecting-IP`
+
+`tailscale serve` puts the tailnet client in `X-Forwarded-For` (`100.64.0.0/10`). After 14.3, Apache reads `CF-Connecting-IP` and stops reading `X-Forwarded-For`. The hostfix proxy copies the client address across, which is what keeps the section 3/4/5 bypass (`RewriteCond expr "! -R '100.64.0.0/10'"`) matching.
+
+[`examples/nginx-tailnet-hostfix.conf`](examples/nginx-tailnet-hostfix.conf) (also inlined in 11.1):
+
+```nginx
+proxy_set_header CF-Connecting-IP $http_x_forwarded_for;
+```
+
+**Known pitfall.** Switching `RemoteIPHeader` to `CF-Connecting-IP` without that `proxy_set_header` makes tailnet clients appear as `<ORIGIN_IP>`. The admin and API locks then treat them as public and return 404. Add the header in the same change. Section 11.2 is the check: the Apache log shows the device's `100.x` address, not `<ORIGIN_IP>`.
+
+### 14.5 Skip edge challenges on callbacks and the API
+
+Gateway callbacks (`/modules/gateways/callback/<gateway>.php`) and `includes/api.php` are server-to-server. A challenge, a managed-rule block, or a rate limit drops the call; there is no browser to solve it. One custom rule on zone `<ZONE_ID>`, action **Skip**.
+
+```
+(starts_with(http.request.uri.path, "/modules/gateways/callback/")) or (http.request.uri.path eq "/includes/api.php")
+```
+
+Leave `/sysadmin` off that expression.
+
+Phases:
+
+| Phase | What it skips |
+|---|---|
+| `http_ratelimit` | Rate limiting rules |
+| `http_request_firewall_managed` | Managed WAF |
+| `http_request_sbfm` | Super Bot Fight Mode |
+
+Products (previous-version equivalents of rate limiting and managed WAF): `rateLimit`, `waf`.
+
+```json
+{
+  "description": "WHMCS gateway callbacks and API: skip rate limit, managed WAF, Super Bot Fight Mode",
+  "expression": "(starts_with(http.request.uri.path, \"/modules/gateways/callback/\")) or (http.request.uri.path eq \"/includes/api.php\")",
+  "action": "skip",
+  "action_parameters": {
+    "phases": [
+      "http_ratelimit",
+      "http_request_firewall_managed",
+      "http_request_sbfm"
+    ],
+    "products": ["rateLimit", "waf"]
+  }
+}
+```
+
+Dashboard: **Security → Security rules → Custom rules**, action **Skip**, and select those phases and products. An API create uses `Authorization: Bearer $CF_API_TOKEN` against zone `<ZONE_ID>` (full `curl` in the example file).
+
+The skip is not an origin allow. Section 4 still returns 404 for public `includes/api.php`. Callbacks stay public on purpose. Bot Fight Mode (Free plan) sits outside these phases and cannot be skipped; use Super Bot Fight Mode when the exemption has to work.
 
 ## Credits
 

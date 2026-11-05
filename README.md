@@ -36,10 +36,10 @@ A practical, upgrade-safe pattern for taking the WHMCS admin area, API, and SSH 
   - [11.2 How to verify](#112-how-to-verify)
 - [12. Checklist after any change](#12-checklist-after-any-change)
 - [13. Passkeys on a tailnet-only admin: admin.example.com](#13-passkeys-on-a-tailnet-only-admin-adminexamplecom-tivro-as-of-2026-11-05)
-- [14. Planned](#14-planned)
+- [14. Cloudflare edge hardening](#14-cloudflare-edge-hardening)
+- [15. Planned](#15-planned)
 - [Credits](#credits)
 - [License](#license)
-- [14. Cloudflare edge hardening](#14-cloudflare-edge-hardening)
 
 ## 1. Goals
 
@@ -393,10 +393,6 @@ The Apache `Substitute` inject in section 13.1 belonged to that removed username
 
 In WHMCS 8 the **Account** menu lives in the **secondary** navbar. Add-on hooks that look for `Account` in the primary navbar never add their item. Our own hook adds "Passkeys" to that secondary menu, pointing at Tivro Passkeys (`index.php?m=tivro_passkeys`), and adds a "Manage Passkeys" panel on the user Security page. See [`examples/hooks/client-passkeys-links.php`](examples/hooks/client-passkeys-links.php). Only our own hooks are included here, no vendor module code.
 
-## 14. Planned
-
-- Auto-renewing DNS-01 for the admin subdomain certificate.
-
 ## 14. Cloudflare edge hardening
 
 Public `example.com` is proxied at Cloudflare. Admin stays on the tailnet (section 11.1) and does not go through that proxy. Placeholders match the table at the top: `<ORIGIN_IP>` is `192.0.2.10`, `<HOME_IP>` is `203.0.113.10`, the zone is `<ZONE_ID>`, the token is `$CF_API_TOKEN`. Snippets: [`examples/cloudflare-edge-hardening.md`](examples/cloudflare-edge-hardening.md).
@@ -508,6 +504,10 @@ Products (previous-version equivalents of rate limiting and managed WAF): `rateL
 Dashboard: **Security → Security rules → Custom rules**, action **Skip**, and select those phases and products. An API create uses `Authorization: Bearer $CF_API_TOKEN` against zone `<ZONE_ID>` (full `curl` in the example file).
 
 The skip is not an origin allow. Section 4 still returns 404 for public `includes/api.php`. Callbacks stay public on purpose. Bot Fight Mode (Free plan) sits outside these phases and cannot be skipped; use Super Bot Fight Mode when the exemption has to work.
+
+## 15. Planned
+
+- Auto-renewing DNS-01 for the admin subdomain certificate.
 
 ## Credits
 
